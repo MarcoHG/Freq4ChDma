@@ -103,14 +103,78 @@ void TCAP_OnChannel1(LDD_TUserData *UserDataPtr)
 {
   /* Write your code here ... */
 	// Measuring Frequency using DMA we don't even enter here
-	static uint16_t tCaptPrev;
-	uint16_t uCapt;
-	++uCapture;
+}
 
-	// Measure frequency using traditional method: limited to 16 bit
-	TCAP_GetCaptureValue(TimerPtr, 0, &uCapt);
-	tPeriodIsr = uCapt >= tCaptPrev?  uCapt - tCaptPrev : uCapt + (0xFFFF - tCaptPrev) +1;
-	tCaptPrev = uCapt;
+/*
+** ===================================================================
+**     Event       :  TCAP_OnChannel2 (module Events)
+**
+**     Component   :  TCAP [TimerUnit_LDD]
+*/
+/*!
+**     @brief
+**         Called if compare register match the counter registers or
+**         capture register has a new content. OnChannel2 event and
+**         Timer unit must be enabled. See [SetEventMask] and
+**         [GetEventMask] methods. This event is available only if a
+**         [Interrupt] is enabled.
+**     @param
+**         UserDataPtr     - Pointer to the user or
+**                           RTOS specific data. The pointer passed as
+**                           the parameter of Init method.
+*/
+/* ===================================================================*/
+void TCAP_OnChannel2(LDD_TUserData *UserDataPtr)
+{
+  /* Write your code here ... */
+}
+
+/*
+** ===================================================================
+**     Event       :  TCAP_OnChannel3 (module Events)
+**
+**     Component   :  TCAP [TimerUnit_LDD]
+*/
+/*!
+**     @brief
+**         Called if compare register match the counter registers or
+**         capture register has a new content. OnChannel3 event and
+**         Timer unit must be enabled. See [SetEventMask] and
+**         [GetEventMask] methods. This event is available only if a
+**         [Interrupt] is enabled.
+**     @param
+**         UserDataPtr     - Pointer to the user or
+**                           RTOS specific data. The pointer passed as
+**                           the parameter of Init method.
+*/
+/* ===================================================================*/
+void TCAP_OnChannel3(LDD_TUserData *UserDataPtr)
+{
+  /* Write your code here ... */
+}
+
+/*
+** ===================================================================
+**     Event       :  TCAP_OnChannel4 (module Events)
+**
+**     Component   :  TCAP [TimerUnit_LDD]
+*/
+/*!
+**     @brief
+**         Called if compare register match the counter registers or
+**         capture register has a new content. OnChannel4 event and
+**         Timer unit must be enabled. See [SetEventMask] and
+**         [GetEventMask] methods. This event is available only if a
+**         [Interrupt] is enabled.
+**     @param
+**         UserDataPtr     - Pointer to the user or
+**                           RTOS specific data. The pointer passed as
+**                           the parameter of Init method.
+*/
+/* ===================================================================*/
+void TCAP_OnChannel4(LDD_TUserData *UserDataPtr)
+{
+  /* Write your code here ... */
 }
 
 /* END Events */

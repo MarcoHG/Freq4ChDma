@@ -16,7 +16,7 @@
 /*************************************************************************
   *   $DEFINES
 *************************************************************************/
-#define NBR_FREQ_CHANNELS				1		/* It will be 4 */
+#define NBR_FREQ_CHANNELS				4		/* It will be 4 */
 /*!
  * The Size of the DMA table depends on the maximumm frequency and the 
  * sampling rate at which we used data (TCAP isr). In our application the 
@@ -26,12 +26,6 @@
  */
 #define NBR_DMA_CAPTURE_SAMPLES 50
 #define CAPTURE_CLOCK_HZ 1125000	// 1121549   /* Ideally should be 1.125MHz */
-
-/*!
- * Define the Flexible Timer Module registers used for capture
- */
-#define FREQ_TCAP_REG_CNT	FTM0_CNT
-#define FREQ_TCAP_REG_CMP FTM0_C0V
 
 
 #define FREQIN_DMA_MSK_NEW_FREQ 	0x01
@@ -46,14 +40,14 @@
  * 	frequency range is detected fHighFreq.
  * 	
  * 	Every time we have a new reading either by pulse detection of input signal
- * 	or every half	the capture timer overflows, the flag fNewFreq is set.
+ * 	or every half	the capture timer overflows, the flag bPulseCtr is inc
  * 	   
  */
 typedef struct
 {
 
 	uint16 dmaTblIndex, dmaTblIndexPrev;
-	uint16 uMswCapTmr;
+	// uint16 uMswCapTmr;
 	uint32 uLastCapture;					// Last captured timer value
 	
 	union
@@ -66,7 +60,7 @@ typedef struct
 		
 	} sPeriod;
 	bool	
-		fNewFreq, fHighFreq, fAmbiguitySolved, fDisplay, fDmaChReady;
+	fNewFreq, fHighFreq, fAmbiguitySolved, fDisplay, fDmaChReady;
 } stDmaFrequency;
 
 
@@ -81,11 +75,10 @@ void initFreqDma(void);
 /*************************************************************************
   *   $GLOBAL VARIABLES
 *************************************************************************/
-extern unsigned int uCapture;			// Test 
 extern unsigned int mSSamplePre, timerTicks;
 extern LDD_TDeviceData *TimerPtr;
-extern uint16 tPeriodIsr;
 extern  stDmaFrequency atFreqIn[];
+extern uint8 bChannelEnblMsk;
 
 /*************************************************************************
   *   $INLINE FUNCTIONS 

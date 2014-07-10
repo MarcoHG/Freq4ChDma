@@ -38,6 +38,10 @@
 //==============================================================================
 //  LOCAL PROTOTYPES.
 //==============================================================================
+/*!
+ * These are a set of functions optionally called after the DMA is completed
+ * @param UserData pointer to user data passed to interrupt
+ */
 void dmaTransferCompleteA(LDD_TUserData *UserData);
 void dmaTransferCompleteB(LDD_TUserData *UserData);
 void dmaTransferCompleteC(LDD_TUserData *UserData);
@@ -52,11 +56,13 @@ LDD_TDeviceData *TP3_ptr = NULL, *TP4_ptr=NULL;
 LDD_TDeviceData *TimerPtr = NULL;
 unsigned int timerTicks, ulPeriod;
 unsigned short uNbrRestarts, uNbrOvfNoPulsePoll;
-uint16 tPeriodIsr;
 uint16 uMswDelta, uMswIndexSampled;
 bool bDisplay = FALSE;
+bool fNewLine = FALSE;
 stDmaFrequency atFreqIn[NBR_FREQ_CHANNELS];
 uint32 uPeriodLimit;
+uint8 bChannelEnblMsk;
+bool displayFloatMode;
 //==============================================================================
 //  LOCAL DATA
 //==============================================================================
@@ -65,13 +71,15 @@ bool monitorEnable = FALSE;
 static LDD_TDeviceData *DMAPtr = NULL;
 static bool afCompleted[NBR_FREQ_CHANNELS];
 static LDD_DMA_TTransferDescriptor TransferDesc;
+static timerCapCtr=0;
+unsigned long int uTimerCaptureClock = CAPTURE_CLOCK_HZ;
 /*! 
  * 	DMA Tables where the Frequency Signals are captured
  */
 static uint16	aDmaCaptureTbl[NBR_FREQ_CHANNELS][NBR_DMA_CAPTURE_SAMPLES];
 
 //
-void (*apfDmaTransferComplete[4])(LDD_TUserData *UserData) =
+void (*apfDmaTransferComplete[NBR_FREQ_CHANNELS])(LDD_TUserData *UserData) =
 {
 	dmaTransferCompleteA, dmaTransferCompleteB, dmaTransferCompleteC, dmaTransferCompleteD			
 };
@@ -86,13 +94,19 @@ void (*apfDmaTransferComplete[4])(LDD_TUserData *UserData) =
 typedef struct tPexDmaTransferDesc
 {
 	LDD_DMA_TAddress 				SourceAddress;			//	The Location in memory to move from
-	LDD_DMA_TChannelNumber 	ChannelNumber;			//	The DMA channel to use for xfer
 	LDD_DMA_TTriggerSource 	TriggerSource;			//	DMA request source (see Kinetis Ref Manual Chapter 3, table 3-24)
+	LDD_DMA_TChannelNumber 	ChannelNumber;			//	The DMA channel to use for xfer
+	uint32									uCiter;							// 	Current Major ITERation count (15 bit) DMA_TCD0_CITER_ELINKNO
+	
 } tPexDmaTransferDesc;
 
-const tPexDmaTransferDesc aTransferDesc[4] =
+const tPexDmaTransferDesc aTransferDesc[NBR_FREQ_CHANNELS] =
 {
-	{(LDD_DMA_TAddress)&FTM0_C4V, 0, 24},			/// FTM0 Channel 0 counter is moved through DMA_Ch0, Trigger source is 24
+	//	Src Mem Address and Req# 				DMA Curr.ITERation major loop
+	{(LDD_DMA_TAddress)&FTM0_C4V, 24, 	0, 	(uint32)&DMA_TCD0_CITER_ELINKNO	},		/// FTM0_CH4 (Req#24)	using DMA_Ch0
+	{(LDD_DMA_TAddress)&FTM0_C5V, 25, 	1, 	(uint32)&DMA_TCD1_CITER_ELINKNO	},		/// FTM0_CH5 (Req#25)	using DMA_Ch1
+	{(LDD_DMA_TAddress)&FTM0_C6V, 26, 	2, 	(uint32)&DMA_TCD2_CITER_ELINKNO	},		/// FTM0_CH6 (Req#26)	using DMA_Ch2
+	{(LDD_DMA_TAddress)&FTM0_C7V, 27, 	3, 	(uint32)&DMA_TCD3_CITER_ELINKNO	},		/// FTM0_CH7 (Req#27)	using DMA_Ch3
 };
 	
 /*!
@@ -148,7 +162,7 @@ void dmaTransferCompleteA(LDD_TUserData *UserData)
 {
   volatile bool *Completed = (volatile bool*)UserData;
   *Completed = TRUE;
-  TP4_NegVal(TP4_ptr);
+  // test TP4_NegVal(TP4_ptr);
 }
 
 // Call backs after DMA complete, we need each per DMA 
@@ -184,6 +198,36 @@ void wasteSometime(uint16 ticks)
 	for(i=0; i< ticks; ++i)
 		__asm volatile ("nop");
 }
+void displayFreqBuffers(void)
+{
+	uint16 i;
+	int16 j;
+	const uint8 abPulseIndTbl[] = {'-', '\\' , '|' , '/' }; 
+	static uint8 abPulseIndCtr[NBR_FREQ_CHANNELS];
+	static uint8 aFreqStr[NBR_FREQ_CHANNELS][40] = {{0},{0},{0},{0}};
+	uint8 abStrOut[10];
+	float f1;
+	
+	if(fNewLine)
+		printf("\r\n");
+	else
+		printf("\r");	// Home
+
+	for(i=0; i< NBR_FREQ_CHANNELS; ++i)
+	{
+		if(atFreqIn[i].fNewFreq)
+		{
+			atFreqIn[i].fNewFreq	= FALSE;	// One shoot
+			sprintf(abStrOut,"[%d%c]",i, abPulseIndTbl[ ++abPulseIndCtr[i]&0x03 ]);
+			if(atFreqIn[i].fHighFreq)
+				f1 = (float)uTimerCaptureClock*atFreqIn[i].sPeriod.sFraction.uDen/(float)atFreqIn[i].sPeriod.sFraction.uNum;
+			else
+				f1 = (float)uTimerCaptureClock/atFreqIn[i].sPeriod.ulTot;
+			sprintf(aFreqStr[i],"%s %f ",abStrOut, f1);
+		}
+		printf("%s",aFreqStr[i]);
+	}
+}		
 
 /*!
  * Timed routine is called at the middle and at the overflow of timer capture counter
@@ -207,111 +251,83 @@ void wasteSometime(uint16 ticks)
  */
 void timerCaptureIsr(void)
 {
+	static uint16 uMswCapTmr =0;	// This is the upper part of the TCAP counter
 	uint16 uNbrEdges;
-	
-	// Increase chance to get a capture in the isr
-	wasteSometime(uWastePreset);	
-	
-	// Translate DMA major loop iteration counter (CITR) to index in the destination table 
-	atFreqIn[0].dmaTblIndex = NBR_DMA_CAPTURE_SAMPLES - DMA_TCD0_CITER_ELINKNO;	// position in table that DMA is going to write in
-		
-	// Get the Number of Pulse Edges between this and last OverFlow
-	uNbrEdges = atFreqIn[0].dmaTblIndex >= atFreqIn[0].dmaTblIndexPrev ?  atFreqIn[0].dmaTblIndex - atFreqIn[0].dmaTblIndexPrev \
-			: atFreqIn[0].dmaTblIndex + (NBR_DMA_CAPTURE_SAMPLES - atFreqIn[0].dmaTblIndexPrev);
-	atFreqIn[0].dmaTblIndexPrev = atFreqIn[0].dmaTblIndex;	// for next detection
-	
-	// The uNbrEdges indicates the amount of captures since last time-isr
-	if(uNbrEdges)
+	uint16 i;
+	// Increase chance to get a capture in the isr:	//wasteSometime(uWastePreset);	
+	TP3_SetVal(TimerPtr);
+	for(i=0; i< NBR_FREQ_CHANNELS; ++i)
+	if(atFreqIn[i].fDmaChReady && bChannelEnblMsk & (1 << i) )
 	{
-		uint16 uTblIndex1;	
-		uint32 uTmrCapture;		// 	Compute the last captured period using full 22 bits
-		uTblIndex1 = DMA_PREV_POS_INDEX(atFreqIn[0].dmaTblIndex, 1);		// 	Index of Ts-1 Last (and safe) capture position
-		
-		//TP3_SetVal(TimerPtr); 
-		TP3_NegVal(TimerPtr);
-		
-		// Keep building the 32bit capture of the last pulse 
-		uTmrCapture =  (uint32)((uint32)atFreqIn[0].uMswCapTmr << 16) +	aDmaCaptureTbl[0][uTblIndex1];	// 	Capture at Ts-1
-		
-		// Get the previous to last capture: 
-		if(uNbrEdges >=2)		// If we had 2 or more captures in previous isr need to get it from DMA
+		// Translate DMA major loop iteration counter (CITR) t2o index in the destination table 
+		atFreqIn[i].dmaTblIndex = NBR_DMA_CAPTURE_SAMPLES - *((uint16 *)aTransferDesc[i].uCiter);	// position in table that DMA is going to write in
+		// Get the Number of Pulse Edges between this and last OverFlow
+		uNbrEdges = atFreqIn[i].dmaTblIndex >= atFreqIn[i].dmaTblIndexPrev ?  atFreqIn[i].dmaTblIndex - atFreqIn[i].dmaTblIndexPrev \
+				: atFreqIn[i].dmaTblIndex + (NBR_DMA_CAPTURE_SAMPLES - atFreqIn[i].dmaTblIndexPrev);
+		atFreqIn[i].dmaTblIndexPrev = atFreqIn[i].dmaTblIndex;	// for next detection
+		// The uNbrEdges indicates the amount of captures since last time-isr
+		if(uNbrEdges)
 		{
-			uint16 uTblIndexN = DMA_PREV_POS_INDEX(atFreqIn[0].dmaTblIndex, uNbrEdges);		//	Index of Ts-2 at DMA
-			// Unambiguous last 2 captures from DMA
-			if(aDmaCaptureTbl[0][uTblIndex1] >= aDmaCaptureTbl[0][uTblIndexN])
-				atFreqIn[0].sPeriod.sFraction.uNum = aDmaCaptureTbl[0][uTblIndex1] - aDmaCaptureTbl[0][uTblIndexN];
-			else
-				atFreqIn[0].sPeriod.sFraction.uNum = aDmaCaptureTbl[0][uTblIndex1] + (0xFFFF - aDmaCaptureTbl[0][uTblIndexN]) +1;
-			atFreqIn[0].sPeriod.sFraction.uDen = uNbrEdges-1;
-			atFreqIn[0].fHighFreq = TRUE;
-		}
-		else
-		{
-			// Need to get the unambiguous from 32 bit values
-			if(uTmrCapture >= atFreqIn[0].uLastCapture)
+			uint16 uTblIndex1;	
+			uint32 uTmrCapture;		// 	Compute the last captured period using full 22 bits
+			uTblIndex1 = DMA_PREV_POS_INDEX(atFreqIn[i].dmaTblIndex, 1);		// 	Index of Ts-1 Last (and safe) capture position
+
+			// Keep building the 32bit capture of the last pulse 
+			uTmrCapture =  (uint32)((uint32)uMswCapTmr << 16) +	aDmaCaptureTbl[i][uTblIndex1];	// 	Capture at Ts-1
+		
+			// Get the previous to last captured: 
+			if(uNbrEdges >=2)		// If we had 2 or more captures in previous isr need to get it from DMA
 			{
-				atFreqIn[0].sPeriod.ulTot = uTmrCapture - atFreqIn[0].uLastCapture;
-				atFreqIn[0].fAmbiguitySolved = FALSE;
-			}
-			else
-			{		
-				atFreqIn[0].fAmbiguitySolved = TRUE;
-				// Ambiguity on lower 16bits
-				if((uTmrCapture & 0xFFFF0000) == (atFreqIn[0].uLastCapture & 0xFFFF0000))			// 1) MSW are the same
-					atFreqIn[0].sPeriod.ulTot = (uTmrCapture + 0x10000) - atFreqIn[0].uLastCapture;	// Carry over from lower 16 bits
-				else	
-					// Ambiguity on full 22 bits
-					atFreqIn[0].sPeriod.ulTot = (uTmrCapture + (uint32)((uint32)(TCAPT_MSW_MAX_VAL + 1) << 16) ) - atFreqIn[0].uLastCapture;	// Rollover 0x3FFFFF
-				
-			}
-			atFreqIn[0].fHighFreq = FALSE;
-		}
-		// ========  Just a Debug artifact ========
-		if(monitorEnable)
-		{
-			if(atFreqIn[0].fDisplay) // && iCiter == DMA_TCD0_CITER_ELINKNO)	// Don't display if a new capture
-			{
-				float f1;
-				if(atFreqIn[0].fHighFreq)
-					f1 = (float)1125000.0*atFreqIn[0].sPeriod.sFraction.uDen/(float)atFreqIn[0].sPeriod.sFraction.uNum;
+				uint16 uTblIndexN = DMA_PREV_POS_INDEX(atFreqIn[i].dmaTblIndex, uNbrEdges);		//	Index of Ts-2 at DMA
+				// Unambiguous last 2 captures from DMA
+				if(aDmaCaptureTbl[i][uTblIndex1] >= aDmaCaptureTbl[i][uTblIndexN])
+					atFreqIn[i].sPeriod.sFraction.uNum = aDmaCaptureTbl[i][uTblIndex1] - aDmaCaptureTbl[i][uTblIndexN];
 				else
-					f1 = (float)1125000.0/atFreqIn[0].sPeriod.ulTot;
-				//
-				printf("\r\n%f ",f1 );
-				if(atFreqIn[0].fAmbiguitySolved)
-					printf("= Amb solved=");   
-				atFreqIn[0].fDisplay = FALSE;
+					atFreqIn[i].sPeriod.sFraction.uNum = aDmaCaptureTbl[i][uTblIndex1] + (0xFFFF - aDmaCaptureTbl[i][uTblIndexN]) +1;
+				atFreqIn[i].sPeriod.sFraction.uDen = uNbrEdges-1;
+				atFreqIn[i].fHighFreq = TRUE;
 			}
-		}
-		else
-		if(atFreqIn[0].fDisplay || atFreqIn[0].fAmbiguitySolved) // && iCiter == DMA_TCD0_CITER_ELINKNO)	// Don't display if a new capture
-		{
-			if(atFreqIn[0].fHighFreq)
-				printf("\r\n%u / %u ", atFreqIn[0].sPeriod.sFraction.uNum, atFreqIn[0].sPeriod.sFraction.uDen);
 			else
-				printf("\r\n%6lu E%d ", atFreqIn[0].sPeriod.ulTot, uNbrEdges);
-			if(atFreqIn[0].fAmbiguitySolved)
-				printf("= Capture inside=");   
-			atFreqIn[0].fDisplay = FALSE;
-		}
-		
-		atFreqIn[0].uLastCapture = uTmrCapture;
-		atFreqIn[0].fNewFreq = TRUE;
-		// 
-		//TP3_ClrVal(TimerPtr);
+			{
+				// Need to get the unambiguous from 32 bit values
+				if(uTmrCapture >= atFreqIn[i].uLastCapture)
+				{
+					atFreqIn[i].sPeriod.ulTot = uTmrCapture - atFreqIn[i].uLastCapture;
+					atFreqIn[i].fAmbiguitySolved = FALSE;
+				}
+				else
+				{		
+					atFreqIn[i].fAmbiguitySolved = TRUE;
+					// Ambiguity on lower 16bits
+					if((uTmrCapture & 0xFFFF0000) == (atFreqIn[i].uLastCapture & 0xFFFF0000))			// 1) MSW are the same
+						atFreqIn[i].sPeriod.ulTot = (uTmrCapture + 0x10000) - atFreqIn[i].uLastCapture;	// Carry over from lower 16 bits
+					else	
+						// Ambiguity on full 22 bits
+						atFreqIn[i].sPeriod.ulTot = (uTmrCapture + (uint32)((uint32)(TCAPT_MSW_MAX_VAL + 1) << 16) ) - atFreqIn[i].uLastCapture;	// Rollover 0x3FFFFF
+				
+				}
+				atFreqIn[i].fHighFreq = FALSE;
+			}
+			// ========  Just a Debug artifact ========
+			atFreqIn[i].uLastCapture = uTmrCapture;
+			atFreqIn[i].fNewFreq = TRUE;
+			
+		}	// if bNbrEdges
+		// 	else		bNoPulseIsr = TRUE;	// We have a Timed isr with no pulse in previous - resync the next isr for low frequency if needed
+	}	// if( ready && enabled)
+	//
+	// Interrupt Epilog: Prepare next Interrupt - we avoid getting captures close to 0xFFFF-0x0000 when in the interrupt
+	if(FTM0_CNT > 0x7FFF )
+		FTM0_C0V = 0xFFFF;		// 	Next isr when compare this value
+	else
+	{
+		// 	We just Crossed 0xFFFF - Keep the higher portion of capture counter 
+		if(++uMswCapTmr > TCAPT_MSW_MAX_VAL)	// We just need 6 extra bits
+			uMswCapTmr =0;											// Roll-over 0x3FFFFF to 0
+		FTM0_C0V = 0x7FFF;						//	Next isr will happen at mid range of counter
 	}
-	// 	else		bNoPulseIsr = TRUE;	// We have a Timed isr with no pulse in previous - resync the next isr for low frequency if needed
-	
-	// Prepare next Interrupt - we avoid getting captures close to 0xFFFF-0x0000 when in the interrupt
-		if(FREQ_TCAP_REG_CNT > 0x7FFF )
-			FREQ_TCAP_REG_CMP = 0xFFFF;		// 	Next isr when compare this value
-		else
-		{
-			// 	We just Crossed 0xFFFF - Keep the higher portion of capture counter 
-			if(++atFreqIn[0].uMswCapTmr > TCAPT_MSW_MAX_VAL)	// We just need 6 extra bits
-				atFreqIn[0].uMswCapTmr =0;		// Roll-over 0x3FFFFF to 0
-			FREQ_TCAP_REG_CMP = 0x7FFF;			//	Next isr will happen at mid range of counter
-		}
+	++timerCapCtr;
+	TP3_ClrVal(TimerPtr);
 }
 
 
@@ -376,8 +392,12 @@ void initFreqDma(void)
 	
 	//	Individually disable Channels 
 	FTM0_C0SC &= ~FTM_CnSC_CHIE_MASK;		// Disable CH0 interrupt and repeat for other channels
-	FTM0_C4SC &= ~FTM_CnSC_CHIE_MASK;		// Disable CH1 interrupt
 	FTM0_C0V = 0x7FFF;									//	Need to have DMA ready before OVrs
+	FTM0_C4SC &= ~FTM_CnSC_CHIE_MASK;		// Disable CH1 interrupt
+	FTM0_C5SC &= ~FTM_CnSC_CHIE_MASK;		// Disable CH2 interrupt
+	FTM0_C6SC &= ~FTM_CnSC_CHIE_MASK;		// Disable CH3 interrupt
+	FTM0_C7SC &= ~FTM_CnSC_CHIE_MASK;		// Disable CH4 interrupt
+	
 	    
 	// 	Enable the base Timer Module by selecting the clk source in CLKS[FTM1_SC]
 	TCAP_Enable(TimerPtr);
@@ -386,83 +406,156 @@ void initFreqDma(void)
 
 void freqDmaRun(void)
 {
-
-	unsigned int uTimerCaptureClock = CAPTURE_CLOCK_HZ;
+	uint8 i;
+	
+  bool fTCapCmpIE = 0, afDmaIE[NBR_FREQ_CHANNELS] = {0,0,0,0};
+  const char abHelpStr[] = 
+  		"\r\nFrequency Measurement Using DMA, press:\r\n" \
+  		"'t' to toggle Tcap IE\r\n" \
+  		"'1' to '4' to toggle DMA channel IE\r\n" \
+  		"'+'/'-' to adjust TCAP Clock frequency calibration\n\r" \
+  		"'n' to toggle new line\n\r" \
+  		"'?' displays this message\r\n";
+  
   
 	// My local init
 	clearTable();
 	
 	uPeriodLimit = 40000L;
+	uint16 uPreset = 4;
 	
 	// Init Test points GPIOs
 	TP3_ptr = TP3_Init(NULL);
 	TP4_ptr = TP4_Init(NULL);
-	  
+	
 	// Init the DMA		
 	initFreqDma();
   // DONE! to start capturing, enable the Channel capture IE in the App
   
+	bChannelEnblMsk = 0x0F;
   
   // remove Debug UART buffering (stream i/o)
   setvbuf(stdout, NULL, _IONBF, 0); // no buffering on stdout - for printf()
   setvbuf(stdin, NULL, _IONBF, 0); // no buffering on stdin - for getchar() etc
   
-  printf("Porting DMA: Capture FTM1_CH0 at PTA12 - press '1','t' to start, 'm' to monitor\n\r");
-  printf("\n\r");
   unsigned int uLocalCapture=0;
   
   // Init Periodic Time Interrupt
   // TINT1_Enable(TINT1Ptr);	// Enable interrupts after we get the pointer to PTA17
   int ch =0;
   uCapture = uLocalCapture =0;
+  printf("%s", abHelpStr);
   while(1)
   {
-  	if(uLocalCapture != uCapture)
-  	{
-  		if(uCapture > 99)
-  			uCapture =0;
-  		uLocalCapture = uCapture; 
-  		  		
-  		// PTA17_NegVal(PTA17_ptr);
-  		printf("(%2u,%u) ", uCapture, tPeriodIsr);	// Isr executed 
-  	}
   	if( (ch = getchar()) != EOF )
   	switch(ch)
   	{
   	// Diable all interrupts
   	case '0':	
+  		
   		FTM0_C0SC &= 	~FTM_CnSC_CHIE_MASK;
-  		FTM0_C4SC &=  ~(FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);		
+  		fTCapCmpIE = FALSE;
+  		afDmaIE[0] = afDmaIE[1] = afDmaIE[2] = afDmaIE[3] = FALSE;
+  		FTM0_C4SC &=  ~(FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);
+  		FTM0_C5SC &=  ~(FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);
+  		FTM0_C6SC &=  ~(FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);
+  		FTM0_C7SC &=  ~(FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);
   		break;
-  	// Enable DMA 
+  		
+  	// Enable/Dsbl DMA on Ch 1
   	case '1' :
-  		FTM0_C4SC |= (FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);		// Enable TCAP_CH4 DMA request
+  		if(!afDmaIE[0])
+  		{
+  			afDmaIE[0] = TRUE;
+  			FTM0_C4SC |= (FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);		// Enable TCAP_CH4 DMA request
+  		}
+  		else
+  		{
+  			afDmaIE[0] = FALSE;
+  			FTM0_C4SC &=  ~(FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);
+  		}
+  		
   		break;
   		
-  	// Enable Isr in Capture 
+  	// Enable/Dsbl DMA on Ch 2  
   	case '2' :
-  		FTM0_C4SC |= FTM_CnSC_CHIE_MASK;													// Test TCAP_CH4 ISR is working
+  		if(!afDmaIE[1])
+  		{
+  			afDmaIE[1] = TRUE;
+  			FTM0_C5SC |= (FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);		// Enable TCAP_CH5 DMA request
+  		}
+  		else
+  		{
+  			afDmaIE[1] = FALSE;
+  			FTM0_C5SC &=  ~(FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);
+  		}
   		break;
   		
+      // Enable/Dsbl DMA on Ch 3  
+    case '3' :
+    	if(!afDmaIE[2])
+    	{
+    		afDmaIE[2] = TRUE;
+    		FTM0_C6SC |= (FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);		// Enable TCAP_CH5 DMA request
+    	}
+    	else
+    	{
+    		afDmaIE[2] = FALSE;
+    		FTM0_C6SC &=  ~(FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);
+    	}
+    	break;
+      	
+      // Enable/Dsb DMA on Ch 4  
+    case '4' :
+    	if(!afDmaIE[3])
+    	{
+    		afDmaIE[3] = TRUE;
+    		FTM0_C7SC |= (FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);		// Enable TCAP_CH4 DMA request
+    	}
+    	else
+    	{
+    		afDmaIE[3] = FALSE;
+    		FTM0_C7SC &=  ~(FTM_CnSC_CHIE_MASK | FTM_CnSC_DMA_MASK);
+    	}
+    	break;
+    		
   	// Enable (OvfIsr)
   	case 't' : case 'T':
-  	  FTM0_C0SC |= FTM_CnSC_CHIE_MASK;													// Test TCAP_CH0 (OVF) ISR is working		
+  		if(!fTCapCmpIE)
+  		{
+  			fTCapCmpIE = TRUE;
+  			FTM0_C0SC |= FTM_CnSC_CHIE_MASK;													// TCAP_CH0 (OVF) ISR will IE will be enabled
+  		}
+  		else
+  		{
+  			fTCapCmpIE = FALSE;
+  			FTM0_C0SC &= 	~FTM_CnSC_CHIE_MASK;			 
+  		}
+
+  				
   	  break;
   	
-  	case '4':
- 			monitorEnable = monitorEnable ? 0 :1;
+  	case 'n': case 'N':
+  		fNewLine = fNewLine ? FALSE: TRUE;
+  		break;
+  		
+ 		case 'f':	case 'F':
+ 			//  			bDisplay = TRUE;
+ 			displayFloatMode = displayFloatMode? FALSE : TRUE;
  			break;
  			
- 		case 'm':
- 			//  			bDisplay = TRUE;
- 			monitorEnable = monitorEnable? FALSE : TRUE;
- 			break;
- 		case '?': 
+ 		case '?':
+ 			// Some help here
+ 			printf("%s", abHelpStr);
+ 			printf("\r\n Status: \r\nTCapAdjFreqCalib %lu Hz, TCAPIE: %d, DMA CH0:%d CH1:%d CH2:%d CH3:%d\n\n", uTimerCaptureClock, fTCapCmpIE, \ 
+ 					afDmaIE[0], afDmaIE[1], afDmaIE[2], afDmaIE[3]);
  			break;
  			
  		case ' ':
- 			bDisplay = TRUE;
- 			atFreqIn[0].fDisplay = TRUE;
+ 			//fDisplayFreq = TRUE;
+ 			for(i=0; i< NBR_FREQ_CHANNELS; ++i)
+ 			if(atFreqIn[i].fDmaChReady && bChannelEnblMsk & (1 << i) )
+ 				atFreqIn[i].fDisplay = TRUE;		// Display a freq Value when Captured 
  			break;
  		case '+':
  			++uTimerCaptureClock;
@@ -476,12 +569,13 @@ void freqDmaRun(void)
  			break;
  			
   	}
-  	if(monitorEnable && atFreqIn[0].fNewFreq)
+  	//	Every 5*0.028 = 140mS
+  	if(timerCapCtr >= uPreset)
   	{
-  		//TP3_SetVal(TimerPtr);
-  		atFreqIn[0].fNewFreq = FALSE;
-  		//TP3_ClrVal(TimerPtr); 
+  		timerCapCtr =0;
+  		displayFreqBuffers();
   	}
+  	
   		
   }
   //  DMA_Deinit(DMAPtr);
